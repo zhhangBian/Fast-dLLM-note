@@ -1190,6 +1190,7 @@ class LLaDABlockGroup(nn.ModuleList):
             block.set_activation_checkpointing(strategy)
 
 
+# 具体的模型
 class LLaDAModel(nn.Module):
     def __init__(self, config: ModelConfig, init_params: bool = True):
         super().__init__()

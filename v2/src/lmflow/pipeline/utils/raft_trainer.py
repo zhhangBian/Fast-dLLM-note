@@ -45,7 +45,7 @@ except ImportError:
     )
     from transformers.hyperparameter_search import default_hp_search_backend,ALL_HYPERPARAMETER_SEARCH_BACKENDS
 
-    
+
 
 # isort: on
 
@@ -1613,14 +1613,14 @@ class RaftTrainer:
                 trial=trial,
                 ignore_keys_for_eval=ignore_keys_for_eval,
             )
-            
-    
+
+
     def _one_train(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
         #print(self.lr_scheduler)
         #print(dir(self.lr_scheduler))
-        
+
 
         self.state = TrainerState()
         self.state.is_hyper_param_search = trial is not None
@@ -1735,7 +1735,7 @@ class RaftTrainer:
         #num_train_epochs = 10
         self.is_in_train = True
         #print("The number of epoches: ", num_train_epochs)
-        ############# 
+        #############
         total_batched_samples = 0
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -2060,7 +2060,7 @@ class RaftTrainer:
         # self.model         is the Transformers Model
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
 
-        
+
 
     def _get_output_dir(self, trial):
         if self.hp_search_backend is not None and trial is not None:

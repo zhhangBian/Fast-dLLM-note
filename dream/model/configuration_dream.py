@@ -27,6 +27,7 @@ logger = logging.get_logger(__name__)
 
 class DreamConfig(PretrainedConfig):
     model_type = "Dream"
+    # 用作过滤输出，并不需要返回给用户
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -80,7 +81,7 @@ class DreamConfig(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
-        
+
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,

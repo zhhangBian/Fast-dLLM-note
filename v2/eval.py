@@ -70,19 +70,20 @@ class Fast_dLLM_v2EvalHarness(LM):
             self.accelerator = accelerator
         else:
             self.accelerator = None
-        
+
         model_kwargs = {}
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
-        
+
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, 
-            trust_remote_code=True, 
-            torch_dtype=torch.bfloat16, 
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
             **model_kwargs
         )
         self.model.eval()
 
+        # 在批量评测中使用 batch_sample 作为批量推理函数
         self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, self.model)
 
         self.device = torch.device(device)
@@ -91,13 +92,13 @@ class Fast_dLLM_v2EvalHarness(LM):
             self.device = torch.device(f'{self.accelerator.device}')
             self._rank = self.accelerator.local_process_index
             self._world_size = self.accelerator.num_processes
-        else: 
+        else:
             self.model = self.model.to(device)
             self._rank = 0
             self._world_size = 1
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
+
         self.show_speed = show_speed
         self.max_new_tokens = max_new_tokens
         self.batch_size = int(batch_size)
@@ -111,7 +112,7 @@ class Fast_dLLM_v2EvalHarness(LM):
     @property
     def rank(self):
         return self._rank
-    
+
     @property
     def world_size(self):
         return self._world_size
@@ -119,13 +120,13 @@ class Fast_dLLM_v2EvalHarness(LM):
     @property
     def tokenizer_name(self):
         return self.model_path
-    
+
     def apply_chat_template(self, chat_history, add_generation_prompt=True):
         return self.tokenizer.apply_chat_template(chat_history, add_generation_prompt=add_generation_prompt, tokenize=False)
-    
+
     def loglikelihood_rolling(self, requests):
         raise NotImplementedError
-    
+
     def _encode_pair(self, context, continuation):
         whole_enc = self.tokenizer(context + continuation)["input_ids"]
         context_enc = self.tokenizer(context)["input_ids"]
@@ -203,16 +204,16 @@ class Fast_dLLM_v2EvalHarness(LM):
                 out.append((ll, 0.0))
         torch.cuda.empty_cache()
         return out
-    
+
     def generate_until(self, requests):
         output = [None] * len(requests)  # pre-allocate output list
         num_tokens = 0
-        
+
         start_time = time.time()
-        
+
         requests_with_indices = [(i, req) for i, req in enumerate(requests)]
         requests_with_indices.sort(key=lambda x: len(x[1].args[0]))
-        
+
         batched_requests = []
         current_batch = []
         for i, req in requests_with_indices:
@@ -220,34 +221,43 @@ class Fast_dLLM_v2EvalHarness(LM):
             if len(current_batch) == self.batch_size:
                 batched_requests.append(current_batch)
                 current_batch = []
-        
+
         if current_batch:
             batched_requests.append(current_batch)
 
         for _, batch in enumerate(tqdm(batched_requests, desc="Generating...")):
+            # input_ids 的集合
             batched_input_ids = []
             max_len = 0
             min_len = 1e9
             seq_len = []
-            
+
             for orig_idx, req in batch:
                 question = req.args[0]
-                
+
                 if req.task_name.startswith('minerva_math'):
                     question = question.replace("Solution:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
                 elif req.task_name.startswith('gsm8k'):
                     question = question.replace("Answer:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
                 model_inputs = self.tokenizer([question], return_tensors="pt").to(self.device)
                 batched_input_ids.append(model_inputs["input_ids"])
+                # 输入序列中的最小长度
                 max_len = max(max_len, model_inputs["input_ids"].shape[1])
+                # 输入序列中的最大长度
                 min_len = min(min_len, model_inputs["input_ids"].shape[1])
+                # 输入序列中的长度
                 seq_len.append(model_inputs["input_ids"].shape[1])
-            
+
             # pad batched_input_ids to the same length
-            batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)], dim=1) for input_ids in batched_input_ids]
+            batched_input_ids = [
+                torch.cat([
+                    input_ids, 
+                    torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)
+                ], dim=1) 
+            for input_ids in batched_input_ids]
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
             batched_input_ids = batched_input_ids.to(self.device)
-            
+
             with torch.no_grad():
                 if self.accelerator is not None:
                     generated_ids = self.accelerator.unwrap_model(self.model).mdm_sample(
@@ -275,18 +285,18 @@ class Fast_dLLM_v2EvalHarness(LM):
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
                     )
-            
+
             # extract new generated tokens, and keep original index order
             for batch_pos, (orig_idx, req) in enumerate(batch):
                 generated_answer = self.tokenizer.decode(
-                    generated_ids[batch_pos][seq_len[batch_pos]:], 
+                    generated_ids[batch_pos][seq_len[batch_pos]:],
                     skip_special_tokens=True
                 )
-            
+
                 # count token number
                 if self.show_speed:
                     num_tokens += (generated_ids[batch_pos][seq_len[batch_pos]:] != self.mask_id).sum()
-                
+
                 # put result in the correct original index position
                 output[orig_idx] = generated_answer
 
@@ -294,16 +304,16 @@ class Fast_dLLM_v2EvalHarness(LM):
                 print('question: ', req.args[0])
                 print('answer: ', generated_answer)
                 print('=' * 20, end='\n\n')
-            
+
         end_time = time.time()
         if self.show_speed:
             print(f"Total number of tokens generated: {num_tokens}")
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
-            
+
         return output
 
 
 if __name__ == "__main__":
     cli_evaluate()
-    
+

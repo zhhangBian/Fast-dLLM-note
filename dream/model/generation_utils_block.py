@@ -35,6 +35,8 @@ from transformers.utils import (
 
 logger = logging.get_logger(__name__)
 
+# 在llada模型中，每步转移的token数量应该尽可能均匀
+# 该函数用于计算在llada模型中每步转移的token数量
 def get_num_transfer_tokens(mask_index, steps):
     '''
     In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
@@ -43,40 +45,53 @@ def get_num_transfer_tokens(mask_index, steps):
 
     This function is designed to precompute the number of tokens that need to be transitioned at each step.
     '''
+    # 当前序列中的mask数量
     mask_num = mask_index.sum(dim=1, keepdim=True)
 
+    # 每个步骤中转移的token数量
     base = mask_num // steps
+    # 剩余的token数量
     remainder = mask_num % steps
 
+    # 每个步骤中转移的token数量
     num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
 
     for i in range(mask_num.size(0)):
+        # 剩余的token数量需要加1
         num_transfer_tokens[i, :remainder[i]] += 1
 
     return num_transfer_tokens
 
 
+# 保留累积概率达到 top_p 的最小token集合
 def top_p_logits(logits, top_p=None):
+    # 对logits进行倒序排序
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    # 计算累积概率
     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    # 计算需要保留的token集合：得到累计值大于top_p对应的所有token的索引
     sorted_indices_to_remove = cumulative_probs > top_p
     # Shift the indices to the right to keep the first token above the threshold
     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
     sorted_indices_to_remove[..., 0] = 0
 
+    # 将不满足条件的位置的topken设置为最小值
     mask = torch.zeros_like(logits, dtype=torch.bool, device=logits.device)
     mask = mask.scatter_(-1, sorted_indices, sorted_indices_to_remove)
     logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
     return logits
 
+# 只保留概率最高的k个token
 def top_k_logits(logits, top_k=None):
     top_k = min(top_k, logits.size(-1))  # Safety check
     # Remove all tokens with a probability less than the last token of the top-k
     indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+    # 将低于阈值的logits设为最小值
     logits = logits.masked_fill(indices_to_remove, torch.finfo(logits.dtype).min)
     return logits
 
 
+# 综合的采样函数
 def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confidence=False, neg_entropy=False):
 
     if temperature > 0:
@@ -85,30 +100,36 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
         logits = top_p_logits(logits, top_p)
     if top_k is not None:
         logits = top_k_logits(logits, top_k)
+    # 得到logits后进行softmax操作
     probs = torch.softmax(logits, dim=-1)
 
+    # 采样
     if temperature > 0:
+        # 尝试进行随机采样
         try:
             x0 = dists.Categorical(probs=probs).sample()
             confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
         except:
             confidence, x0 = probs.max(dim=-1)
+    # 贪婪采样（选择概率最高的）
     else:
         confidence, x0 = probs.max(dim=-1)
-    
+
+    # 计算置信度
     if margin_confidence:
+        # 对概率进行排序
         sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
         # Extract top1 and top2 probabilities
-        top1_probs = sorted_probs[:, 0] 
-        top2_probs = sorted_probs[:, 1] 
+        top1_probs = sorted_probs[:, 0]
+        top2_probs = sorted_probs[:, 1]
         # Calculate confidence as top1 - top2
-        confidence = top1_probs - top2_probs 
-    
+        confidence = top1_probs - top2_probs
+
     if neg_entropy:
         epsilon = 1e-10
         log_probs = torch.log(probs + epsilon)
         confidence = torch.sum(probs * log_probs, dim=-1)
-    
+
     return confidence, x0
 
 
@@ -169,6 +190,7 @@ class DreamGenerationConfig(GenerationConfig):
         pass
 
 class DreamGenerationMixin:
+    # 将输入的input_ids和attention_mask扩展为batch_size * expand_size的形状
     @staticmethod
     def _expand_inputs_for_generation(
         expand_size: int = 1,
@@ -186,6 +208,7 @@ class DreamGenerationMixin:
             attention_mask = attention_mask.repeat_interleave(expand_size, dim=0)
         return input_ids, attention_mask
 
+    # 检查想要生成的长度时候符合
     def _validate_generated_length(self, generation_config, input_ids_length, has_default_max_length):
         """Performs validation related to the resulting generated length"""
 
@@ -210,6 +233,7 @@ class DreamGenerationMixin:
                 " increasing `max_length` or, better yet, setting `max_new_tokens`."
             )
 
+    # 配置需要的she生成长度
     def _prepare_generated_length(
         self,
         generation_config,
@@ -237,6 +261,7 @@ class DreamGenerationMixin:
 
         return generation_config
 
+    # 得到相应的生成参数
     def _prepare_generation_config(
         self, generation_config: Optional[DreamGenerationConfig], **kwargs: Dict
     ) -> DreamGenerationConfig:
@@ -269,6 +294,7 @@ class DreamGenerationMixin:
 
         return generation_config
 
+    # 直接生成特殊token的对应tensor，在后续可以不需要重复进行计算
     def _prepare_special_tokens(
         self,
         generation_config: DreamGenerationConfig,
@@ -315,6 +341,7 @@ class DreamGenerationMixin:
         generation_config._pad_token_tensor = pad_token_tensor
         generation_config._mask_token_tensor = mask_token_tensor
 
+    # 进行相应的diffusion生成
     @torch.no_grad()
     def diffusion_generate(
         self,
@@ -342,7 +369,7 @@ class DreamGenerationMixin:
         )
 
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
-        
+
         # 4. Check input_ids
         if not is_torchdynamo_compiling() and self.device.type != input_ids.device.type:
             warnings.warn(
@@ -356,7 +383,7 @@ class DreamGenerationMixin:
             )
         if (
             hasattr(generation_config, "pad_token_id") and
-            torch.any(input_ids == generation_config.pad_token_id) and 
+            torch.any(input_ids == generation_config.pad_token_id) and
             attention_mask is None
         ):
             warnings.warn(
@@ -365,15 +392,17 @@ class DreamGenerationMixin:
                 UserWarning,
             )
 
+        # 进行生成
         input_ids, attention_mask = self._expand_inputs_for_generation(
             expand_size=generation_config.num_return_sequences,
             input_ids=input_ids,
-            attention_mask=attention_mask 
+            attention_mask=attention_mask
         )
         threshold = kwargs.get("threshold", 0.9)
         block_length = kwargs.get("block_length", 32)
         dual_cache = kwargs.get("dual_cache", False)
 
+        # 进行sample过程
         result = self._sample(
             input_ids,
             attention_mask=attention_mask,
@@ -384,6 +413,10 @@ class DreamGenerationMixin:
         )
         return result
 
+    # 进行实际的分块生成过程
+    # dual_cache 是一种双缓存机制，用于在分块生成过程中同时管理两种不同的缓存状态：
+    # 1. 前文缓存：保留输入序列的 KV 缓存
+    # 2. 块内替换缓存：标记当前块内哪些位置需要被替换
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -394,7 +427,7 @@ class DreamGenerationMixin:
         dual_cache: bool = False,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
-        
+
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
@@ -411,14 +444,16 @@ class DreamGenerationMixin:
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
         gen_length = max_length - input_ids.shape[1]
-        
+
         # Handle block configuration
         if block_length is None:
             block_length = gen_length  # Default: single block (original behavior)
-        
+
+        # 得到相应的block数量
         assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
         num_blocks = gen_length // block_length
-        
+
+        # 得到每一步需要处理的block数量
         assert steps % num_blocks == 0, f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
         steps_per_block = steps // num_blocks
         timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
@@ -443,18 +478,21 @@ class DreamGenerationMixin:
 
         # Process each block
         for num_block in range(num_blocks):
-            
+
             current_block_start = input_ids.shape[1] + num_block * block_length
             current_block_end = current_block_start + block_length
 
+            # 跑一遍全局的，得到基本的cache
             # update cache
             model_output = self(x, attention_mask, tok_idx, use_cache=True)
+            # 得到基础的cache
             past_key_values = model_output.past_key_values
+            # 得到logits并进行sample
             logits = model_output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
             confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
             x[:, current_block_start] = x0[:, current_block_start]
-            
+
             # Extract only previous block cache
             if not dual_cache:
                 new_past_key_values = []
@@ -466,53 +504,59 @@ class DreamGenerationMixin:
             else:
                 replace_position = torch.zeros_like(x, dtype=torch.bool)
                 replace_position[:, current_block_start:current_block_end] = 1
-                
+
             i = 1
             while True:
                 # Use cache for generation
+                # 如果开启了dual cache，那么之前块的都不需要进行生成，使用cache的结果，使用index进行限制
                 if dual_cache:
                     mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
+                # 对于之前的所有index都要进行生成
                 else:
                     mask_index = (x[:, current_block_start:] == mask_token_id)
-                
+
                 # Prepare attention mask for cached generation
                 if attention_mask != "full":
                     # Adjust attention mask for current position
                     current_attention_mask = attention_mask[:, :, :, current_block_start:]
                 else:
                     current_attention_mask = attention_mask
-                
+
+                # 调用self进行生成
                 if dual_cache:
-                    model_output = self(x[:, current_block_start:current_block_end], current_attention_mask, 
-                                    tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None, 
+                    model_output = self(x[:, current_block_start:current_block_end], current_attention_mask,
+                                    tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None,
                                     past_key_values=past_key_values, use_cache=True, dual_cache=dual_cache, replace_position=replace_position)
                 else:
-                    model_output = self(x[:, current_block_start:], current_attention_mask, 
-                                    tok_idx[:, current_block_start:] if tok_idx is not None else None, 
+                    model_output = self(x[:, current_block_start:], current_attention_mask,
+                                    tok_idx[:, current_block_start:] if tok_idx is not None else None,
                                     past_key_values=past_key_values, use_cache=True)
                 logits = model_output.logits
                 logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+
+                # 两种填充策略
+                # 1. 置信度阈值：一次性选择所有 mask 位，阈值过滤
                 if alg == 'confidence_threshold':
                     mask_logits = logits[mask_index]
-                
+
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-                    
+
                     if dual_cache:
                         x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
                     else:
                         x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
-                    
+
                     x_[mask_index] = x0.clone()
                     full_confidence[mask_index] = confidence
                     full_confidence[:, block_length:] = -torch.inf
-                    
+
                     current_transfer_tokens = (x[:, current_block_start:current_block_end] == mask_token_id).sum()
-                    
+
                     selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
                     transfer_index = torch.zeros_like(x_, device=x.device, dtype=torch.bool)
-                    
+
                     select_index = select_index.to(x.device)
                     transfer_index[0, select_index[0]] = True
                     for k in range(1, current_transfer_tokens):
@@ -522,6 +566,7 @@ class DreamGenerationMixin:
                         x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
                     else:
                         x[:, current_block_start:][transfer_index] = x_[transfer_index]
+                # 扩散式步进：按时间步配额，负熵作为置信度，Top-k/采样挑位置
                 else:
                     if i == steps_per_block:
                         break
@@ -538,7 +583,7 @@ class DreamGenerationMixin:
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
                     full_confidence[mask_index] = confidence
                     full_confidence[:, block_length:] = -torch.inf
-                    
+
                     if number_transfer_tokens > 0:
                         if alg_temp is None or alg_temp == 0:
                             _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
@@ -561,7 +606,7 @@ class DreamGenerationMixin:
                 if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:
                     break
 
-        
+
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,
